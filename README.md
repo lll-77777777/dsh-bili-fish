@@ -34,6 +34,8 @@ dsh plugin --profile desktop add link:E:/大肥鱼人设/dsh-bili-fish
 - 总开关
 - 生物钟窗口（默认 21:00 ~ 23:30）
 - 「今天不想看」的概率（默认 30%）
+- **写完推送到微信**（默认开）：日记写好后经 `dsh-wechat-send` 把两篇合成一条发到微信；关掉就只落盘不发
+- **日记存到哪**：留空用默认 `~/.dsh/bili-fish/diary/`，填别的目录也可以
 - 现在写一篇（调试/补写）
 - 看今天的两篇日记
 
@@ -43,6 +45,7 @@ dsh plugin --profile desktop add link:E:/大肥鱼人设/dsh-bili-fish
 - **需要刷B站插件提供报告数据**：[dsh-bili-scroll（lll-77777777 fork）](https://github.com/lll-77777777/dsh-bili-scroll)（上游：[c1overzz/dsh-bili-scroll](https://github.com/c1overzz/dsh-bili-scroll)）。它每轮把报告写到 `~/.dsh/bili-duty/out/<日期>.md`，养鱼读这个文件当素材；**没装也能用**，只是日记写「空白日」。
 - 另外会读 DSH 会话日志里的**当天工作流水**（`~/.dsh/sessions/**/*.jsonl.zstd`），只取主人说的话，最近 40 条。
 - 写日记走 `dsh --profile headless <prompt>`，那个 profile 需要有模型凭据（跟刷B站插件一样）
+- **微信推送（可选）**：装了 dsh-wechat 插件才用得上；没装就把「写完推送到微信」关掉。插件会自动在 `~/.dsh/profiles/*/node_modules/dsh-wechat-plugin/cli.js` 里找发送入口。
 
 ## 数据
 
@@ -50,9 +53,9 @@ dsh plugin --profile desktop add link:E:/大肥鱼人设/dsh-bili-fish
 | --- | --- |
 | `~/.dsh/bili-fish/config.json` | 设置 |
 | `~/.dsh/bili-fish/state.json` | 今天计划几点醒、掷没掷到不想看 |
-| `~/.dsh/bili-fish/diary/` | 日记 |
+| `~/.dsh/bili-fish/diary/` | 日记（可在设置里改目录） |
 | `~/.dsh/bili-fish/fish.log` | 日志 |
 
 ## 开发
 
-改 `index.js` / `lib/**` 之后完全重启 DSH 生效；只改设置字段（Config + DEFAULTS）保存即生效。改代码前建议先 `node --check index.js`。
+改 `index.js` / `lib/**` 之后完全重启 DSH 生效；只改设置字段（Config + DEFAULTS）保存即生效。改代码前建议先 `node --check index.js`（有顶层 await 的先 cp 成 `.mjs`）；改完 apply 逻辑最好再用 mock ctx 跑一遍（mock `effect` / `webServer.register` / `settings.register`），确认启动顺序没踩 TDZ、路由都注册上了。

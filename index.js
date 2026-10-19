@@ -12,7 +12,7 @@
  */
 import { spawn } from 'node:child_process'
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { zstdDecompressSync } from 'node:zlib'
 import { loadHostDeps } from './lib/hostdeps.mjs'
@@ -33,6 +33,9 @@ const DEFAULTS = {
   headlessProfile: 'headless',
   dshBin: '',
   personaFile: '',
+  wechatPush: true,
+  wechatCli: '',
+  diaryDir: '',
 }
 
 const Config = z ? z.object({
@@ -43,6 +46,9 @@ const Config = z ? z.object({
   headlessProfile: z.string().default(DEFAULTS.headlessProfile).extra('volatile', true).description('写日记用的 DSH profile'),
   dshBin: z.string().default(DEFAULTS.dshBin).extra('volatile', true).description('dsh 可执行文件路径（留空自动探测）'),
   personaFile: z.string().default(DEFAULTS.personaFile).extra('volatile', true).description('人设文件路径（留空用内置）'),
+  wechatPush: z.boolean().default(DEFAULTS.wechatPush).extra('volatile', true).description('写完日记后推一条到微信'),
+  wechatCli: z.string().default(DEFAULTS.wechatCli).extra('volatile', true).description('dsh-wechat-send 入口（留空自动探测）'),
+  diaryDir: z.string().default(DEFAULTS.diaryDir).extra('volatile', true).description('日记存放目录（留空用默认）'),
 }) : null
 
 /** 掷到「今天不想看」时随手挑一句写在状态里（不写日记） */
@@ -65,11 +71,14 @@ const FALLBACK_PERSONA = [
 
 export function apply(ctx, config) {
   const stateDir = stateDirOf(ctx)
-  const diaryDir = join(stateDir, 'diary')
+  /** 日记目录：配置里填了就用它，否则 <DSH_HOME>/bili-fish/diary */
+  const diaryDirOf = () => {
+    const custom = String(cfg.diaryDir || '').trim()
+    return custom ? resolve(custom) : join(stateDir, 'diary')
+  }
   const logFile = join(stateDir, 'fish.log')
   const cfgFile = join(stateDir, 'config.json')
   const stateFile = join(stateDir, 'state.json')
-  ensureDir(diaryDir)
 
   const log = (msg) => {
     try { appendFileSync(logFile, `[${new Date().toISOString()}] ${msg}\n`, 'utf8') } catch { /* 无所谓 */ }
@@ -90,6 +99,7 @@ export function apply(ctx, config) {
   }
   const cfg = normalize(readJson(cfgFile, {}), normalize(config || {}, DEFAULTS))
   const saveCfg = () => writeJson(cfgFile, cfg)
+  ensureDir(diaryDirOf())
 
   const homeDir = () => process.env.DSH_HOME || join(homedir(), '.dsh')
   const reportFile = (day) => join(homeDir(), 'bili-duty', 'out', `${day}.md`)
@@ -99,12 +109,75 @@ export function apply(ctx, config) {
     const explicit = String(cfg.dshBin || '').trim()
     if (explicit && existsSync(explicit)) return { command: process.execPath, args: [explicit], shell: false }
     const guesses = [
+      // 宿主自带的 dsh（Electron 打包版：<安装目录>\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js）
+      // 2026-10-19 教训：之前没这条，落到 `dsh` + shell:true —— prompt 里的换行被 cmd 截断，
+      // 模型只收到半截（以为"用户还没说话"），跑完 code=0 却一篇日记都没写。
+      (() => {
+        try {
+          const exe = process.execPath
+          if (!exe) return ''
+          return join(dirname(exe), 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+        } catch { return '' }
+      })(),
       join(process.env.APPDATA || '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
       '/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
       '/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
     ].filter(Boolean)
     for (const g of guesses) if (existsSync(g)) return { command: process.execPath, args: [g], shell: false }
     return { command: 'dsh', args: [], shell: true }
+  }
+
+  /* ─────────────── 找微信发送入口（dsh-wechat 插件的 cli.js 就是 dsh-wechat-send） ─────────────── */
+  const resolveWechat = () => {
+    const explicit = String(cfg.wechatCli || '').trim()
+    const guesses = []
+    if (explicit) guesses.push(explicit)
+    // 各 profile 里装着的 dsh-wechat 插件：优先 cli.js（node 直跑，参数不经 shell，换行安全）
+    const profilesDir = join(homeDir(), 'profiles')
+    try {
+      for (const e of readdirSync(profilesDir, { withFileTypes: true })) {
+        if (!e.isDirectory()) continue
+        guesses.push(join(profilesDir, e.name, 'node_modules', 'dsh-wechat-plugin', 'cli.js'))
+      }
+    } catch { /* 无所谓 */ }
+    for (const g of guesses) {
+      if (!g) continue
+      try { if (!existsSync(g)) continue } catch { continue }
+      return { command: process.execPath, args: [g], shell: false }
+    }
+    return null
+  }
+
+  const sendWechatText = (cli, text) => new Promise((resolve) => {
+    let child
+    try {
+      child = spawn(cli.command, [...cli.args, text], { shell: cli.shell, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: process.env })
+    } catch (e) { resolve({ code: -1, err: String(e?.message || e) }); return }
+    let out = ''
+    const timer = setTimeout(() => {
+      try { child.kill() } catch { /* 无所谓 */ }
+      resolve({ code: -1, err: '超时 30 秒' })
+    }, 30_000)
+    child.stdout?.on('data', (b) => { out += String(b) })
+    child.stderr?.on('data', (b) => { out += String(b) })
+    child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, err: String(e?.message || e) }) })
+    child.on('exit', (code) => { clearTimeout(timer); resolve({ code, out: out.slice(-300) }) })
+  })
+
+  /** 把当天的两篇日记（拼成一条）推到微信；返回 { ok, code?, error?, out? } */
+  const pushWechat = async (today, selfFile, ownerFile) => {
+    const cli = resolveWechat()
+    if (!cli) return { ok: false, error: '没找到微信插件（dsh-wechat-send）' }
+    const self = readText(selfFile).trim()
+    const owner = readText(ownerFile).trim()
+    if (!self && !owner) return { ok: false, error: '日记还是空的' }
+    const clip = (s) => (s.length > 1600 ? s.slice(0, 1600) + '…' : s)
+    const parts = [`【${today} 的日记】`]
+    if (owner) parts.push('\n—— 给主人的信 ——\n' + clip(owner))
+    if (self) parts.push('\n—— 自己的日记 ——\n' + clip(self))
+    const text = parts.join('\n').trim()
+    const r = await sendWechatText(cli, text)
+    return { ...r, ok: r.code === 0 }
   }
 
   /* ─────────────── 今天的工作流水（从 DSH 会话日志里摘主人说过的话） ─────────────── */
@@ -227,8 +300,9 @@ export function apply(ctx, config) {
     if (running.busy) return { ok: false, error: '正在写了' }
     running.busy = true
     const today = dayKey()
-    const selfFile = join(diaryDir, `${today}-self.md`)
-    const ownerFile = join(diaryDir, `${today}-for-owner.md`)
+    try { ensureDir(diaryDirOf()) } catch { /* 无所谓 */ }
+    const selfFile = join(diaryDirOf(), `${today}-self.md`)
+    const ownerFile = join(diaryDirOf(), `${today}-for-owner.md`)
     try {
       const report = readText(reportFile(today)).slice(0, 3500)
       const workLog = readWorkLog()
@@ -260,9 +334,15 @@ export function apply(ctx, config) {
       })
       const selfOk = hasContent(selfFile)
       const ownerOk = hasContent(ownerFile)
+      let wechat = null
+      if (cfg.wechatPush && (selfOk || ownerOk)) {
+        wechat = await pushWechat(today, selfFile, ownerFile)
+        log('微信推送：' + JSON.stringify(wechat))
+      }
       const st = readJson(stateFile, {})
       st.lastWake = new Date().toISOString()
       st.lastResult = selfOk && ownerOk ? '写好了' : `跑完了但缺文件（code=${out.code} self=${selfOk} owner=${ownerOk}）`
+      st.wechatResult = !cfg.wechatPush ? '未开推送' : (wechat ? (wechat.ok ? '已推到微信' : `推送失败：${wechat.error || ('code=' + wechat.code)}`) : '日记是空的，没推')
       if (out.code === 0 && (selfOk || ownerOk)) st.writtenDay = today
       writeJson(stateFile, st)
       log(`日记结果：self=${selfOk} owner=${ownerOk}`)
@@ -317,8 +397,8 @@ export function apply(ctx, config) {
   const status = () => {
     const st = readJson(stateFile, {})
     const today = dayKey()
-    const selfFile = join(diaryDir, `${today}-self.md`)
-    const ownerFile = join(diaryDir, `${today}-for-owner.md`)
+    const selfFile = join(diaryDirOf(), `${today}-self.md`)
+    const ownerFile = join(diaryDirOf(), `${today}-for-owner.md`)
     return {
       ok: true,
       version: VERSION,
@@ -330,10 +410,14 @@ export function apply(ctx, config) {
       lastWake: st.lastWake || '',
       lastResult: st.lastResult || '',
       skipReason: st.skipReason || '',
+      wechatPush: cfg.wechatPush,
+      wechatResult: st.wechatResult || '',
       today,
       hasSelf: hasContent(selfFile),
       hasOwner: hasContent(ownerFile),
       home: stateDir,
+      diaryDir: diaryDirOf(),
+      diaryDirCfg: cfg.diaryDir,
     }
   }
 
@@ -361,6 +445,7 @@ export function apply(ctx, config) {
       const cleaned = normalize(cfg, DEFAULTS)
       for (const k of Object.keys(cleaned)) cfg[k] = cleaned[k]
       saveCfg()
+      try { ensureDir(diaryDirOf()) } catch { /* 无所谓 */ }
       log('配置已更新：' + JSON.stringify(cfg))
       return sendJson(res, 200, { ok: true, config: cfg })
     }
@@ -370,8 +455,8 @@ export function apply(ctx, config) {
     }
     if (req.method === 'GET' && path === '/api/bili-fish/diary') {
       const day = String(url.searchParams.get('day') || '').trim() || dayKey()
-      const self = readText(join(diaryDir, `${day}-self.md`))
-      const owner = readText(join(diaryDir, `${day}-for-owner.md`))
+      const self = readText(join(diaryDirOf(), `${day}-self.md`))
+      const owner = readText(join(diaryDirOf(), `${day}-for-owner.md`))
       return sendJson(res, 200, { ok: true, day, self, owner })
     }
     if (req.method === 'GET' && path === '/api/bili-fish/log') {
