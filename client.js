@@ -762,6 +762,111 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* ── 侧边栏的「待办」小页（v0.12.0，接 dsh-better-sidebar 的 registerTab）── */
+    function TodoTab({ visible }) {
+      const [data, setData] = React.useState(null)
+      const [text, setText] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [err, setErr] = React.useState('')
+
+      const load = React.useCallback(async () => {
+        try { setData(await jget('/todos')) } catch (e) { setErr(String((e && e.message) || e)) }
+      }, [])
+      React.useEffect(() => { load() }, [load])
+      React.useEffect(() => {
+        if (visible === false) return undefined
+        const t = setInterval(load, 60 * 1000)
+        return () => clearInterval(t)
+      }, [load, visible])
+
+      const act = async (path, body) => {
+        setBusy(true); setErr('')
+        try {
+          const r = await jpost(path, body)
+          if (!r || !r.ok) setErr((r && r.error) || '没成')
+          await load()
+          return r
+        } catch (e) { setErr(String((e && e.message) || e)); return null } finally { setBusy(false) }
+      }
+      const add = async () => {
+        const t = String(text || '').trim()
+        if (!t) return
+        const r = await act('/todo', { action: 'add', text: t })
+        if (r && r.ok) setText('')
+      }
+      const done = (id) => act('/todo', { action: 'done', id })
+      const remove = (id) => act('/todo', { action: 'remove', id })
+
+      const d = data || {}
+      const rem = d.reminders || []
+      const manual = d.manual || []
+      const memo = d.memo || []
+      const total = rem.length + manual.length + memo.length
+
+      const fmtAt = (iso) => {
+        if (!iso) return ''
+        const t = new Date(iso)
+        if (Number.isNaN(t.getTime())) return String(iso).slice(0, 16)
+        const pad = (n) => (n < 10 ? '0' + n : String(n))
+        return (t.getMonth() + 1) + '-' + pad(t.getDate()) + ' ' + pad(t.getHours()) + ':' + pad(t.getMinutes())
+      }
+
+      const row = (x, isMemo) => h('div', {
+        key: x.id,
+        style: { display: 'flex', gap: '6px', alignItems: 'flex-start', padding: '5px 6px', borderRadius: '6px', background: 'rgba(255,255,255,.04)' },
+      },
+        h('button', {
+          'data-bf-btn': '', title: isMemo ? '标成做完（记忆库里那条会变成 stale）' : '做完了',
+          disabled: busy || undefined, style: { padding: '0 7px', fontSize: '12px', flex: 'none' },
+          onClick: () => done(x.id),
+        }, '✓'),
+        h('div', { style: { flex: 1, fontSize: '12.5px', lineHeight: 1.5, opacity: isMemo ? .82 : 1, wordBreak: 'break-word' } },
+          x.text,
+          isMemo ? h('span', { style: { marginLeft: '5px', fontSize: '10px', opacity: .5 } }, '记忆库') : null),
+        isMemo ? null : h('button', {
+          'data-bf-btn': '', title: '删掉', disabled: busy || undefined,
+          style: { padding: '0 7px', fontSize: '12px', opacity: .55, flex: 'none' },
+          onClick: () => remove(x.id),
+        }, '✕'),
+      )
+
+      return h('div', { 'data-bf-page': '', style: { padding: '12px 12px 16px', maxWidth: 'none' } },
+        h('style', null, CSS),
+        h('div', { 'data-bf-label': '' }, total ? total + ' 件等着' : '没有待办'),
+        h('div', { 'data-bf-note': '', style: { marginTop: '4px' } },
+          '手写的在这儿勾；记忆库的标完成就是标成 stale。'),
+        h('div', { style: { display: 'flex', gap: '6px', marginTop: '10px' } },
+          h('input', {
+            'data-bf-input': '', value: text, placeholder: '加一条…',
+            style: { flex: 1 },
+            onChange: (e) => setText(e.target.value),
+            onKeyDown: (e) => { if (e && e.key === 'Enter') add() },
+          }),
+          h('button', { 'data-bf-btn': '', disabled: busy || undefined, style: { flex: 'none', padding: '0 12px' }, onClick: add }, '加')),
+        h('div', { style: { display: 'grid', gap: '5px', marginTop: '12px' } },
+          rem.length ? h('div', { 'data-bf-note': '', style: { marginTop: '2px' } }, '我答应过你的提醒') : null,
+          rem.map((x) => h('div', {
+            key: x.id,
+            style: { display: 'flex', gap: '6px', alignItems: 'flex-start', padding: '5px 6px', borderRadius: '6px', background: 'rgba(59,130,246,.10)' },
+          },
+            h('span', { style: { flex: 'none', fontSize: '12px', lineHeight: '20px' } }, '⏰'),
+            h('div', { style: { flex: 1, fontSize: '12.5px', lineHeight: 1.5, wordBreak: 'break-word' } },
+              x.text,
+              h('div', { style: { fontSize: '10.5px', opacity: .6, marginTop: '1px' } },
+                fmtAt(x.at) + (x.status === 'scheduled' ? ' 待触发' : ''))),
+          )),
+          manual.length ? h('div', { 'data-bf-note': '', style: { marginTop: '2px' } }, '自己记的') : null,
+          manual.map((x) => row(x, false)),
+          memo.length ? h('div', { 'data-bf-note': '', style: { marginTop: '8px' } }, '记忆库里还没做完的') : null,
+          memo.map((x) => row(x, true)),
+        ),
+        (!memo.length && d.memoryEnabled)
+          ? h('div', { 'data-bf-note': '', style: { marginTop: '8px' } }, '记忆库里没读到待办（路径 ' + (d.memoDb ? '在' : '没通') + '）')
+          : null,
+        err ? h('div', { 'data-bf-err': '', style: { marginTop: '6px' } }, err) : null,
+      )
+    }
+
     return {
       inject: ['slots'],
       apply(ctx) {
@@ -787,6 +892,15 @@ window.__ModuleLoader__.load({
                 order: 90,
                 single: true,
                 component: (p) => h(FeedTab, { visible: p && p.visible }),
+              })
+              bs.registerTab({
+                id: 'bili-fish:todo',
+                title: '待办',
+                description: '主人交代过、还没做完的事：自己记的 + 记忆库里的',
+                icon: h('span', { style: { fontSize: '15px', lineHeight: 1 } }, '📋'),
+                order: 91,
+                single: true,
+                component: (p) => h(TodoTab, { visible: p && p.visible }),
               })
               return true
             }

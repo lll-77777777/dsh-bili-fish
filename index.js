@@ -27,7 +27,7 @@ import { loadHostDeps } from './lib/hostdeps.mjs'
 import { stateDirOf, readJson, writeJson, ensureDir, dayKey, windowTimes, readText, hasContent } from './lib/state.mjs'
 import { loadAffection, adjustAffection, describeAffection, parseAffectionMarker, AFFECTION_DEFAULT, tierOf, idleDecay } from './lib/affection.mjs'
 import { loadMood, setMood, bumpMood, describeMood, decayMood, parseMoodMarker, moodPromptBlock, moodList, moodSnapshot, applyEvent, viewOf, eventList, MOODS, MOOD_EVENTS, PERSONA_TRAITS, MOOD_DEFAULT_KEY } from './lib/mood.mjs'
-import { resolveDbPath, readMemo, writeDiaryMemory, readPendingTodos } from './lib/memory.mjs'
+import { resolveDbPath, readMemo, writeDiaryMemory, readPendingTodos, readPendingTodoRows, markMemoTodoDone } from './lib/memory.mjs'
 import { generateDiaryImage, diaryImagePrompt } from './lib/image.mjs'
 import { fetchWeather, buildMorningPrompt, parseMorningReply, listMemes, weekdayOf, rollMorningMood } from './lib/morning.mjs'
 import { sendSystem } from './lib/notify.mjs'
@@ -37,7 +37,7 @@ import { syncWidgetLevel, widgetStatus } from './lib/widget.mjs'
 const hostDeps = await loadHostDeps()
 const z = hostDeps.z
 const defineTool = hostDeps.defineTool
-const VERSION = '0.11.1'
+const VERSION = '0.12.0'
 
 export const name = 'bili-fish'
 export const inject = ['webServer', 'tools', 'settings']
@@ -1221,9 +1221,120 @@ export function apply(ctx, config) {
     }
   }
 
+  /* ── v0.12 待办（侧边栏「待办」页）────────────────────────────
+   * 两个来源合在一起：自己手写的（state.todos）+ 记忆库里 project/todo 的条目。
+   * 手写的能勾能删；记忆库的勾掉就是把那条标成 stale（done）。
+   */
+  const manualTodos = () => {
+    const st = readJson(stateFile, {})
+    const arr = Array.isArray(st.todos) ? st.todos : []
+    return arr.filter((x) => x && x.text).map((x) => ({
+      id: String(x.id || ''),
+      text: String(x.text || '').slice(0, 240),
+      done: !!x.done,
+      createdAt: Number(x.createdAt) || 0,
+      from: 'manual',
+    }))
+  }
+
+  /**
+   * 读 DSH 自己的定时提醒（<DSH_HOME>/storages/schedule.json），只留还活着的那些。
+   * 这是宿主的内部存储，格式可能变；任何一步失败都静默返回空数组。
+   */
+  const readScheduledReminders = () => {
+    try {
+      const file = join(homeDir(), 'storages', 'schedule.json')
+      const raw = readText(file)
+      if (!raw) return []
+      const j = JSON.parse(raw)
+      const tasks = (j && j.tables && j.tables.tasks) || {}
+      const out = []
+      for (const k of Object.keys(tasks)) {
+        const t = tasks[k] || {}
+        const r = t.record || {}
+        if (!r || !r.title) continue
+        const st = String(t.status || '')
+        if (st === 'inactive' || st === 'cancelled' || st === 'completed') continue
+        out.push({
+          id: 'rem:' + String(r.id || k),
+          text: String(r.title).slice(0, 200),
+          at: r.scheduledAt || r.at || '',
+          kind: String(r.kind || ''),
+          status: st,
+        })
+      }
+      out.sort((a, b) => String(a.at).localeCompare(String(b.at)))
+      return out.slice(0, 20)
+    } catch {
+      return []
+    }
+  }
+
+  const listTodos = async () => {
+    const manual = manualTodos()
+    let memo = []
+    const db = memoryDb()
+    if (cfg.memoryEnabled !== false && db) {
+      try {
+        memo = await readPendingTodoRows(db, [cfg.memoryProject].filter(Boolean), 30)
+      } catch { /* 记忆库读不到就当没有 */ }
+    }
+    return {
+      reminders: readScheduledReminders(),
+      manual: manual.filter((x) => !x.done),
+      manualDone: manual.filter((x) => x.done).slice(0, 8),
+      memo: memo.map((x) => ({ id: 'memo:' + x.id, text: x.text, project: x.project, updatedAt: x.updatedAt, from: 'memo' })),
+      memoDb: db || '',
+      memoryEnabled: cfg.memoryEnabled !== false,
+    }
+  }
+
+  const addTodo = (text) => {
+    const t = String(text || '').trim().slice(0, 240)
+    if (!t) return { ok: false, error: '写点什么吧' }
+    const st = readJson(stateFile, {})
+    const arr = Array.isArray(st.todos) ? st.todos : []
+    const item = { id: 't' + Date.now().toString(36), text: t, done: false, createdAt: Date.now() }
+    arr.unshift(item)
+    st.todos = arr.slice(0, 200)
+    writeJson(stateFile, st)
+    log('加了一条待办：' + t)
+    return { ok: true, item }
+  }
+
+  const doneTodo = async (id) => {
+    const raw = String(id || '')
+    if (raw.startsWith('memo:')) {
+      const realId = raw.slice(5)
+      const db = memoryDb()
+      if (!db) return { ok: false, error: '记忆库没找到路径' }
+      const ok = await markMemoTodoDone(db, realId)
+      return ok ? { ok: true, memo: true } : { ok: false, error: '记忆库里没改到（可能已经标过）' }
+    }
+    const st = readJson(stateFile, {})
+    const arr = Array.isArray(st.todos) ? st.todos : []
+    const hit = arr.find((x) => x && x.id === raw)
+    if (!hit) return { ok: false, error: '没找到这条待办' }
+    hit.done = true
+    hit.doneAt = Date.now()
+    st.todos = arr
+    writeJson(stateFile, st)
+    return { ok: true }
+  }
+
+  const removeTodo = (id) => {
+    const raw = String(id || '')
+    const st = readJson(stateFile, {})
+    const arr = Array.isArray(st.todos) ? st.todos : []
+    const next = arr.filter((x) => !(x && x.id === raw))
+    if (next.length === arr.length) return { ok: false, error: '没找到这条（记忆库的条目不能删，只能勾完成）' }
+    st.todos = next
+    writeJson(stateFile, st)
+    return { ok: true }
+  }
+
   /** 最近 N 天的日记目录（设置页「历史」用） */
-  const listDiaries = (limit = 30) => {
-    const dir = diaryDirOf()
+  const listDiaries = (limit = 30) => {    const dir = diaryDirOf()
     let names = []
     try { names = readdirSync(dir) } catch { return [] }
     const days = new Set()
@@ -1518,6 +1629,17 @@ export function apply(ctx, config) {
       }
       const st = readJson(stateFile, {})
       return sendJson(res, 200, { ok: true, morning: st.morning || null, last: st.lastMorningResult || '', memeDir: memeDirOf() })
+    }
+    if (req.method === 'GET' && path === '/api/bili-fish/todos') {
+      return sendJson(res, 200, { ok: true, ...(await listTodos()) })
+    }
+    if (req.method === 'POST' && path === '/api/bili-fish/todo') {
+      const body = await readBody(req)
+      const action = String(body.action || 'add').toLowerCase()
+      if (action === 'add') return sendJson(res, 200, addTodo(body.text))
+      if (action === 'done') return sendJson(res, 200, await doneTodo(body.id))
+      if (action === 'remove') return sendJson(res, 200, removeTodo(body.id))
+      return sendJson(res, 400, { ok: false, error: '未知 action：' + action })
     }
     if (req.method === 'POST' && path === '/api/bili-fish/unread') {
       const body = await readBody(req)
