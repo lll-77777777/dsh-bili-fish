@@ -25,15 +25,19 @@ import { homedir } from 'node:os'
 import { zstdDecompressSync } from 'node:zlib'
 import { loadHostDeps } from './lib/hostdeps.mjs'
 import { stateDirOf, readJson, writeJson, ensureDir, dayKey, windowTimes, readText, hasContent } from './lib/state.mjs'
-import { loadAffection, adjustAffection, describeAffection, parseAffectionMarker, AFFECTION_DEFAULT } from './lib/affection.mjs'
-import { loadMood, setMood, bumpMood, describeMood, decayMood, parseMoodMarker, moodPromptBlock, moodList, MOODS, MOOD_DEFAULT_KEY } from './lib/mood.mjs'
-import { resolveDbPath, readMemo, writeDiaryMemory } from './lib/memory.mjs'
+import { loadAffection, adjustAffection, describeAffection, parseAffectionMarker, AFFECTION_DEFAULT, tierOf, idleDecay } from './lib/affection.mjs'
+import { loadMood, setMood, bumpMood, describeMood, decayMood, parseMoodMarker, moodPromptBlock, moodList, moodSnapshot, applyEvent, viewOf, eventList, MOODS, MOOD_EVENTS, PERSONA_TRAITS, MOOD_DEFAULT_KEY } from './lib/mood.mjs'
+import { resolveDbPath, readMemo, writeDiaryMemory, readPendingTodos } from './lib/memory.mjs'
 import { generateDiaryImage, diaryImagePrompt } from './lib/image.mjs'
+import { fetchWeather, buildMorningPrompt, parseMorningReply, listMemes, weekdayOf, rollMorningMood } from './lib/morning.mjs'
+import { sendSystem } from './lib/notify.mjs'
+import { feedFood, foodSnapshot, foodPromptSnippet, FOODS, hungerLevel } from './lib/food.mjs'
+import { syncWidgetLevel, widgetStatus } from './lib/widget.mjs'
 
 const hostDeps = await loadHostDeps()
 const z = hostDeps.z
 const defineTool = hostDeps.defineTool
-const VERSION = '0.3.0'
+const VERSION = '0.11.1'
 
 export const name = 'bili-fish'
 export const inject = ['webServer', 'tools', 'settings']
@@ -46,22 +50,50 @@ const DEFAULTS = {
   headlessProfile: 'headless',
   dshBin: '',
   personaFile: '',
-  wechatPush: true,
+  wechatPush: false,
   wechatCli: '',
   diaryDir: '',
   /* ── v0.2 新增 ── */
   affectionEnabled: true,
   affectionDaily: 15,
   moodEnabled: true,
+  moodDailyRhythm: true,
   moodTtlHours: 12,
   memoryEnabled: true,
   memoryDbPath: '',
   memoryProject: 'B站养鱼',
-  imageEnabled: true,
+  imageEnabled: false,
   imageSize: '1024x1024',
   weeklyReview: true,
   randomEvent: true,
   proactivePush: true,
+  /* ── v0.4 新增 ── */
+  affectionDecayDays: 0,
+  /* ── v0.5 新增：早安推送 ── */
+  morningEnabled: false,
+  morningCity: '上海',
+  morningWindowStart: '05:30',
+  morningWindowEnd: '11:30',
+  morningImage: true,
+  morningMemeDir: '',
+  morningRandomMood: true,
+  /* ── v0.7 新增：素材来源 + 思考语气 ── */
+  sourceBiliReport: true,
+  sourceWorkLog: true,
+  sourceMemory: true,
+  sourceManual: false,
+  manualSourceDir: '',
+  thinkMoodEnabled: true,
+  /* ── v0.8 新增：通知通路（没装微信插件的人也得知道日记写好了） ── */
+  notifySystem: false,
+  notifyBrowser: true,
+  notifyBadge: true,
+  notifyInbox: true,
+  /* ── v0.9 新增：喂食 ── */
+  feedingEnabled: true,
+  feedDecayPerHour: 4,
+  feedHungryEvent: true,
+  widgetSync: false,
 }
 
 const Config = z ? z.object({
@@ -79,6 +111,7 @@ const Config = z ? z.object({
   affectionDaily: z.number().default(DEFAULTS.affectionDaily).extra('volatile', true).description('每日结算好感度的最大幅度（±N）'),
   moodEnabled: z.boolean().default(DEFAULTS.moodEnabled).extra('volatile', true).description('心情系统（日记和对话都按心情来）'),
   moodTtlHours: z.number().default(DEFAULTS.moodTtlHours).extra('volatile', true).description('心情多久开始淡回去（小时）'),
+  moodDailyRhythm: z.boolean().default(DEFAULTS.moodDailyRhythm).extra('volatile', true).description('心情跟着时辰起伏（早上蔫、下午精神、夜里困）'),
   memoryEnabled: z.boolean().default(DEFAULTS.memoryEnabled).extra('volatile', true).description('读写 meow-memory 记忆库'),
   memoryDbPath: z.string().default(DEFAULTS.memoryDbPath).extra('volatile', true).description('记忆库路径（留空自动探测）'),
   memoryProject: z.string().default(DEFAULTS.memoryProject).extra('volatile', true).description('日记记忆的归属项目名'),
@@ -87,6 +120,28 @@ const Config = z ? z.object({
   weeklyReview: z.boolean().default(DEFAULTS.weeklyReview).extra('volatile', true).description('周日多写一篇「这周」'),
   randomEvent: z.boolean().default(DEFAULTS.randomEvent).extra('volatile', true).description('每天掷一句随机小事件'),
   proactivePush: z.boolean().default(DEFAULTS.proactivePush).extra('volatile', true).description('推送开头说一句今天发现的事'),
+  affectionDecayDays: z.number().default(DEFAULTS.affectionDecayDays).extra('volatile', true).description('久不聊天扣好感：超过 N 天没说话每天扣 1（0 = 关，最低扣到 20）'),
+  morningEnabled: z.boolean().default(DEFAULTS.morningEnabled).extra('volatile', true).description('每天早上第一次醒来推一条早安到微信（天气 + 穿衣 + 待办）'),
+  morningCity: z.string().default(DEFAULTS.morningCity).extra('volatile', true).description('早安天气用的城市（中文名，或中国天气网 9 位 key）'),
+  morningWindowStart: z.string().default(DEFAULTS.morningWindowStart).extra('volatile', true).description('早安推送窗口开始（HH:MM）'),
+  morningWindowEnd: z.string().default(DEFAULTS.morningWindowEnd).extra('volatile', true).description('早安推送窗口结束（HH:MM）'),
+  morningImage: z.boolean().default(DEFAULTS.morningImage).extra('volatile', true).description('早安消息配一张表情包'),
+  morningMemeDir: z.string().default(DEFAULTS.morningMemeDir).extra('volatile', true).description('表情包目录（留空自动找 <工作区>/meme）'),
+  morningRandomMood: z.boolean().default(DEFAULTS.morningRandomMood).extra('volatile', true).description('每天早上随机一个新心情（配合心情系统）'),
+  sourceBiliReport: z.boolean().default(DEFAULTS.sourceBiliReport).extra('volatile', true).description('日记素材：读刷B站报告'),
+  sourceWorkLog: z.boolean().default(DEFAULTS.sourceWorkLog).extra('volatile', true).description('日记素材：读当天工作流水（会话消息）'),
+  sourceMemory: z.boolean().default(DEFAULTS.sourceMemory).extra('volatile', true).description('日记素材：读记忆库（主人最近提过的事）'),
+  sourceManual: z.boolean().default(DEFAULTS.sourceManual).extra('volatile', true).description('日记素材：读自己放的素材目录'),
+  manualSourceDir: z.string().default(DEFAULTS.manualSourceDir).extra('volatile', true).description('素材目录（放 *.md/*.txt，每天自动读当天的或最新的一个）'),
+  thinkMoodEnabled: z.boolean().default(DEFAULTS.thinkMoodEnabled).extra('volatile', true).description('思考过程也带心情（语气随好感度/心情变，判断不变）'),
+  notifySystem: z.boolean().default(DEFAULTS.notifySystem).extra('volatile', true).description('用系统通知提醒（Windows 多半要额外注册，可能不弹）'),
+  notifyBrowser: z.boolean().default(DEFAULTS.notifyBrowser).extra('volatile', true).description('DSH 页面开着时用浏览器通知提醒'),
+  notifyBadge: z.boolean().default(DEFAULTS.notifyBadge).extra('volatile', true).description('设置页显示一个「有新内容」的红点'),
+  notifyInbox: z.boolean().default(DEFAULTS.notifyInbox).extra('volatile', true).description('下次对话时由 AI 主动提一句（写进状态，agent 会读）'),
+  feedingEnabled: z.boolean().default(DEFAULTS.feedingEnabled).extra('volatile', true).description('喂食系统（饱腹度、饿了自己会说、喂了会高兴）'),
+  feedDecayPerHour: z.number().default(DEFAULTS.feedDecayPerHour).extra('volatile', true).description('饱腹度每小时掉多少（默认 4，一天不喂就空了）'),
+  feedHungryEvent: z.boolean().default(DEFAULTS.feedHungryEvent).extra('volatile', true).description('饿的时候真的记一个心情事件（不是硬塞的）'),
+  widgetSync: z.boolean().default(DEFAULTS.widgetSync).extra('volatile', true).description('把肚子同步到右下角挂件（改它的随机语句，F5 才生效）'),
 }) : null
 
 /** 掷到「今天不想看」时随手挑一句写在状态里（不写日记） */
@@ -153,6 +208,33 @@ export function apply(ctx, config) {
   const cfg = normalize(readJson(cfgFile, {}), normalize(config || {}, DEFAULTS))
   const saveCfg = () => writeJson(cfgFile, cfg)
   ensureDir(diaryDirOf())
+
+  /* ─────────────── 通知（没装微信插件的人，也不能一声不响） ─────────────── */
+  /**
+   * 记一条「有新内容」。这是所有通知通路的源数据：
+   * 设置页红点、浏览器通知、下次对话时 agent 读的，全从这里来。
+   * 三个提醒入口都关了就不留未读，免得状态里堆着没人看。
+   */
+  const markUnread = (kind, meta = {}) => {
+    if (cfg.notifyBadge === false && cfg.notifyInbox === false && cfg.notifyBrowser === false) return null
+    const st = readJson(stateFile, {})
+    st.unread = { at: Date.now(), kind, day: dayKey(), ...meta }
+    writeJson(stateFile, st)
+    return st.unread
+  }
+
+  const clearUnread = () => {
+    const st = readJson(stateFile, {})
+    const had = st.unread || null
+    if (had) { st.unread = null; writeJson(stateFile, st) }
+    return had
+  }
+
+  /** 系统通知：可选通路，发不出去只记一句，不影响别的 */
+  const trySystemNotify = async (title, body) => {
+    if (!cfg.notifySystem) return null
+    try { return await sendSystem({ title, body }) } catch (e) { return { ok: false, error: String(e?.message || e) } }
+  }
 
   const homeDir = () => process.env.DSH_HOME || join(homedir(), '.dsh')
   const reportFile = (day) => join(homeDir(), 'bili-duty', 'out', `${day}.md`)
@@ -368,16 +450,20 @@ export function apply(ctx, config) {
   }
 
   /* ─────────────── 提示词 ─────────────── */
-  const buildPrompt = ({ today, report, workLog, persona, selfFile, ownerFile, recentDiaries, memo, affection, mood, yesterdayMood, event, extraNote }) => {
+  const buildPrompt = ({ today, report, workLog, persona, selfFile, ownerFile, recentDiaries, memo, affection, mood, yesterdayMood, event, extraNote, manual = '', degraded = false, food = '' }) => {
     const material = report
       ? `下面是今天「刷B站」插件写好的报告，只当素材（可能很长，不要复述成总结）：\n\n${report}`
-      : '今天没有刷B站的记录（刷B站插件没跑，或者今天没看）。素材是空的，就写你自己的空白日。'
+      : '今天没有刷B站的记录（插件没跑、今天没看，或者主人关掉了这个来源）。素材是空的，就写你自己的空白日。'
     const work = workLog
       ? `下面是主人今天跟你说过的话（按时间从早到晚，只是摘录）——今天的工作大概就在这些里面：\n\n${workLog}`
       : '今天主人没跟你说什么。'
+    const manualBlock = manual
+      ? `下面是主人自己放的素材（今天的备忘/碎片，只当素材，别当事实全信）：\n\n${manual}`
+      : ''
     const parts = [persona, '', `今天是 ${today}。`]
     if (extraNote) parts.push('', '【补充要求】', extraNote)
     if (event) parts.push('', `【今天的一件小事（把它自然地写进去，别硬塞）】\n${event}`)
+    if (food) parts.push('', `【你今天的肚子】\n${food}\n（饿的感觉、被喂了什么，可以自然地写进日记，别写成数据）`)
     if (mood) parts.push('', moodPromptBlock(mood, { yesterday: yesterdayMood }))
     if (recentDiaries) parts.push('', `【前几天你自己写的（用来接上语气和情绪，别复述）】\n${recentDiaries}`)
     if (memo) parts.push('', `【你记得的、主人最近提过的事（仅供参考，别当成今天发生的）】\n${memo}`)
@@ -394,19 +480,22 @@ export function apply(ctx, config) {
       '',
       '【今天的素材】',
       material,
+      ...(manualBlock ? [manualBlock] : []),
       '',
       '【今天的工作】',
       work,
       '',
       '【现在要做的】',
-      '你在养鱼——写两篇日记，不是给用户看总结，是写你自己的一天。',
+      degraded
+        ? '你在养鱼。今天四个素材来源都空着——这是正常的，不是出错。所以写两篇短短的「空日」日记：只写你此刻的心情、今天掷到的那件小事、和主人之间最近的好感度变化，别编造任何没发生的事。'
+        : '你在养鱼——写两篇日记，不是给用户看总结，是写你自己的一天。',
       '别编造素材里没有的事实；素材不够就写「今天没看到什么」，不要硬凑。',
       '今天的工作也可以写进去：挑你真在意的说，给主人的信可以吐槽/邀功，自己的日记可以写你藏着的那点情绪。',
       '',
       '1. 给主人的信：写给使用者，可以撒娇、吐槽、说软话，称呼「主人」。',
       '2. 自己的日记：不加滤镜，写你自己真正想的，可以丧、可以犯懒。',
       '',
-      '两篇都要：第一人称、短句、口语，别写公文；150～400 字；有细节，提到具体视频、评论或事情就点出来；落款日期写 ' + today + '。',
+      `两篇都要：第一人称、短句、口语，别写公文；${degraded ? '120～250' : '150～400'} 字；${degraded ? '写空日的感觉就够，不要硬凑细节' : '有细节，提到具体视频、评论或事情就点出来'}；落款日期写 ${today}。`,
       '',
       '【输出（必须做）】',
       '把「给主人的信」写进：' + ownerFile,
@@ -481,11 +570,13 @@ export function apply(ctx, config) {
     const ownerFile = join(diaryDirOf(), `${today}-for-owner.md`)
     const imageBase = join(diaryDirOf(), `cover-${today}`)
     try {
-      const report = readText(reportFile(today)).slice(0, 3500)
-      const workLog = readWorkLog()
+      const report = cfg.sourceBiliReport ? readText(reportFile(today)).slice(0, 3500) : ''
+      const workLog = cfg.sourceWorkLog ? readWorkLog() : { text: '', lines: [] }
       const persona = readText(String(cfg.personaFile || '').trim()) || FALLBACK_PERSONA
       const recentDiaries = readRecentDiaries(3)
-      const memo = cfg.memoryEnabled ? await readMemo({ dbPath: memoryDb(), projects: [String(cfg.memoryProject || 'B站养鱼'), '全局'], limit: 12 }) : ''
+      const manual = manualSourceText(today)
+      const memo = (cfg.memoryEnabled && cfg.sourceMemory) ? await readMemo({ dbPath: memoryDb(), projects: [String(cfg.memoryProject || 'B站养鱼'), '全局'], limit: 12 }) : ''
+      const degraded = !report && !workLog.text && !memo && !manual
       const affection = cfg.affectionEnabled ? loadAffection(stateFile) : null
       const mood = cfg.moodEnabled ? loadMood(stateFile, affection ? affection.value : 50) : null
       const yesterdayMood = mood && Array.isArray(mood.history)
@@ -498,8 +589,27 @@ export function apply(ctx, config) {
         mood: mood ? { ...mood, ttlHours: Math.max(1, Number(cfg.moodTtlHours) || 12) } : null,
         yesterdayMood,
         event,
+        manual,
+        degraded,
+        food: cfg.feedingEnabled ? foodPromptSnippet(stateFile, Date.now(), cfg.feedDecayPerHour) : '',
         extraNote: why === 'manual' ? '这是主人手动点「现在写一篇」触发的，写法照旧。' : '',
       })
+      /* 素材快照（设置页状态区显示，避免每次都重新扫盘） */
+      try {
+        const prev = readJson(stateFile, {})
+        writeJson(stateFile, {
+          ...prev,
+          sources: {
+            day: today,
+            at: Date.now(),
+            biliReport: { enabled: !!cfg.sourceBiliReport, has: Boolean(report) },
+            workLog: { enabled: !!cfg.sourceWorkLog, lines: (workLog.lines || []).length },
+            memory: { enabled: !!(cfg.memoryEnabled && cfg.sourceMemory), has: Boolean(memo) },
+            manual: { enabled: !!cfg.sourceManual, dir: manualDirOf(), has: Boolean(manual) },
+            degraded,
+          },
+        })
+      } catch (e) { log('写素材快照失败：' + (e?.message ?? e)) }
       const out = await runHeadless(prompt, `日记·${why}`)
 
       /* ── 收文件 + 剥标记 ── */
@@ -531,6 +641,7 @@ export function apply(ctx, config) {
           day: today,
         })
         log(`好感度结算：${affectionResult.prev} → ${affectionResult.value}（${delta >= 0 ? '+' : ''}${delta}）${marker?.reason ? '｜' + marker.reason : ''}`)
+        markTalk()
       }
 
       /* ── 心情结算 ── */
@@ -595,7 +706,9 @@ export function apply(ctx, config) {
       let wechat = null
       let prefix = ''
       if (cfg.wechatPush && (selfOk || ownerOk)) {
-        if (cfg.proactivePush && workLog.lines.length) {
+        /* 「醒的时候找主人」按好感度档位（persona 8.1：75 以上才会自己先开口） */
+        const affNow = cfg.affectionEnabled ? loadAffection(stateFile).value : 50
+        if (cfg.proactivePush && (workLog.lines || []).length && tierOf(affNow).proactive !== 'none') {
           prefix = proactiveLine(workLog.lines)
         }
         wechat = await pushWechat(today, selfFile, ownerFile, image?.ok ? image.path : '', prefix)
@@ -622,6 +735,18 @@ export function apply(ctx, config) {
       st.attempts = attempts.filter((a) => Date.now() - a.at < 86_400_000).slice(-10)
       writeJson(stateFile, st)
       log(`日记结果：self=${selfOk} owner=${ownerOk}`)
+
+      /* 记一条未读 + 可选系统通知（微信没装的人靠这条）
+         注意顺序：markUnread 是自己读文件再写，别用上面那个 st 覆盖它 */
+      if (selfOk || ownerOk) {
+        markUnread('diary', { title: '今天的日记写好了', day: today })
+        const sysR = await trySystemNotify('小肥鱼', '今天的日记写好了，有空来看。')
+        if (sysR) {
+          const st2 = readJson(stateFile, {})
+          st2.notifyResult = sysR.ok ? '系统通知已发' : ('系统通知失败：' + (sysR.error || ''))
+          writeJson(stateFile, st2)
+        }
+      }
       return { ok: selfOk && ownerOk, self: selfOk, owner: ownerOk, affection: affectionResult, mood: moodResult, memory: memoryResult, image: image?.ok ? true : false, wechat: wechat || null, week: week?.ok || false }
     } catch (e) {
       log('写日记异常：' + (e?.stack || e))
@@ -713,9 +838,239 @@ export function apply(ctx, config) {
     return { skip: false }
   }
 
+  /** 记一次「主人跟我说话了」（久不聊天的计时从这儿重新算） */
+  const markTalk = () => {
+    try {
+      const st = readJson(stateFile, {})
+      st.lastTalkAt = Date.now()
+      st.decayCharged = 0
+      writeJson(stateFile, st)
+    } catch { /* 落盘失败不影响主流程 */ }
+  }
+
+  /** 久不聊天扣好感（persona 8.4；默认关，扣到 20 为止，不追着补扣） */
+  const maybeDecay = () => {
+    try {
+      const days = Number(cfg.affectionDecayDays) || 0
+      if (!cfg.affectionEnabled || days <= 0) return null
+      const st = readJson(stateFile, {})
+      const aff = loadAffection(stateFile)
+      const r = idleDecay({ lastTalkAt: st.lastTalkAt, affection: aff.value, days })
+      const already = Number(st.decayCharged) || 0
+      const owed = Math.max(0, r.owed - already)
+      const delta = -Math.min(owed, Math.max(0, aff.value - 20))
+      if (!delta) return null
+      const res = adjustAffection(stateFile, delta, { reason: r.reason, mood: '有点闷，也有点想被叫一声', source: 'idle-decay' })
+      const st2 = readJson(stateFile, {})
+      st2.decayCharged = already + owed
+      writeJson(stateFile, st2)
+      log(`久不聊天扣好感：${res.prev} → ${res.value}（${r.reason}）`)
+      return res
+    } catch (e) {
+      log('衰减检查出错：' + (e?.message ?? e))
+      return null
+    }
+  }
+
+  /**
+   * 环境自己推的情绪事件：深夜还在忙、半天没人说话。每天各一次，别刷屏。
+   * 这两件不是「主人做了什么」，是日子本身的样子——所以放在 tick 里，不等对话。
+   */
+  const maybeAutoMoodEvents = () => {
+    try {
+      if (!cfg.moodEnabled || !cfg.affectionEnabled) return
+      const today = dayKey()
+      const hour = new Date().getHours()
+      const st = readJson(stateFile, {})
+      const done = st.moodAuto || {}
+      if (hour < 5 && done.lateWork !== today) {
+        applyEvent(stateFile, 'lateWork', { affection: loadAffection(stateFile).value, source: 'auto' })
+        const s = readJson(stateFile, {})
+        s.moodAuto = { ...(s.moodAuto || {}), lateWork: today }
+        writeJson(stateFile, s)
+        log('情绪：深夜还在干活')
+      }
+      const gapHours = st.lastTalkAt ? (Date.now() - Number(st.lastTalkAt)) / 3600000 : 0
+      if (gapHours >= 10 && done.ignored !== today) {
+        applyEvent(stateFile, 'ignored', { affection: loadAffection(stateFile).value, source: 'auto', note: '主人半天没说话了' })
+        const s = readJson(stateFile, {})
+        s.moodAuto = { ...(s.moodAuto || {}), ignored: today }
+        writeJson(stateFile, s)
+        log('情绪：被冷落（半天没说话）')
+      }
+      /* 饿：饱腹度掉到「饿了」档才记，一天一次 */
+      if (cfg.feedingEnabled && cfg.feedHungryEvent && done.hungry !== today) {
+        const snap = foodSnapshot(stateFile, Date.now(), cfg.feedDecayPerHour)
+        const lv = hungerLevel(snap.satiety)
+        if (lv === 'hungry' || lv === 'starving') {
+          applyEvent(stateFile, 'hungry', { affection: loadAffection(stateFile).value, source: 'auto', note: '饱腹度 ' + snap.satiety })
+          const s2 = readJson(stateFile, {})
+          s2.moodAuto = { ...(s2.moodAuto || {}), hungry: today }
+          writeJson(stateFile, s2)
+          log('情绪：饿了（饱腹度 ' + snap.satiety + '）')
+        }
+      }
+    } catch (e) {
+      log('自动情绪事件失败：' + (e?.message || e))
+    }
+  }
+
+  /* ─────────────── 早安推送（v0.5） ─────────────── */
+  const morningRunning = { busy: false }
+
+  /** 表情包目录：配置优先，否则找 <工作区>/meme 或日记目录的隔壁 */
+  const memeDirOf = () => {
+    const custom = String(cfg.morningMemeDir || '').trim()
+    if (custom) return resolve(custom)
+    const cands = [join(workspaceDir(), 'meme'), join(dirname(diaryDirOf()), 'meme')]
+    for (const c of cands) {
+      try { if (existsSync(c)) return c } catch { /* 无所谓 */ }
+    }
+    return ''
+  }
+
+  /** 每天只在早安窗口里、且今天还没推过时跑 */
+  const maybeMorning = async () => {
+    if (!cfg.morningEnabled || morningRunning.busy) return
+    const today = dayKey()
+    const st = readJson(stateFile, {})
+    if (st.morning && st.morning.day === today) return
+    const { start, end } = windowTimes(cfg.morningWindowStart, cfg.morningWindowEnd)
+    const now = Date.now()
+    if (now < start || now > end) return
+    await runMorning('clock')
+  }
+
+  /**
+   * 拉天气 → 掷心情 → 让子会话写一段早安 → 配表情包 → 推微信。
+   * @param {string} why clock(自动) / manual(设置页按钮)
+   */
+  const runMorning = async (why) => {
+    if (morningRunning.busy) return { ok: false, error: '正在推' }
+    morningRunning.busy = true
+    const today = dayKey()
+    try {
+      const weather = await fetchWeather(cfg.morningCity)
+      log(`早安：天气 ${weather.ok ? weather.city + ' ' + weather.temp + '℃ ' + weather.today.type : '没查到（' + (weather.error || '') + '）'}`)
+
+      /* 早上不随机抽心情了，改成掷一次「昨晚睡得怎么样」——心情从这件事上长出来 */
+      if (cfg.morningRandomMood && cfg.moodEnabled) {
+        try {
+          const aff0 = loadAffection(stateFile)
+          const r = Math.random()
+          const kind = r < 0.25 ? 'badSleep' : r < 0.7 ? 'goodSleep' : ''
+          if (kind) {
+            const ev = applyEvent(stateFile, kind, { affection: aff0.value, source: 'morning', note: kind === 'badSleep' ? '昨晚没睡好' : '昨晚睡得沉' })
+            log(`早安：身体状态 ${kind} → ${ev.label || ev.error}（${ev.valence}/${ev.arousal}）`)
+          }
+        } catch (e) { log('早安：身体状态失败 ' + (e?.message || e)) }
+      }
+
+      const aff = loadAffection(stateFile)
+      const tier = tierOf(aff.value)
+      const moodNow = loadMood(stateFile, aff.value)
+      const memes = cfg.morningImage ? listMemes(memeDirOf(), (d) => readdirSync(d)) : []
+      let pending = []
+      try { pending = await readPendingTodos(memoryDb(), [cfg.memoryProject]) } catch { /* 无所谓 */ }
+
+      const prompt = buildMorningPrompt({
+        weather, mood: moodNow, affection: aff.value, tier, pending, memes, weekday: weekdayOf(),
+      }) + (cfg.feedingEnabled
+        ? `\n\n【肚子】${foodPromptSnippet(stateFile, Date.now(), cfg.feedDecayPerHour)}。（饿了就顺口提一句想吃什么，别硬塞）`
+        : '')
+      const target = join(diaryDirOf(), `morning-${today}.md`)
+      ensureDir(diaryDirOf())
+      try { unlinkSync(target) } catch { /* 没旧文件 */ }
+      const full = prompt + '\n\n把写好的这段早安消息放进下面这个文件（直接新建写入；不要用 shell 复制或移动，不要去找旧文件，也不要做别的事）：\n' + target
+      const out = await runHeadless(full, `早安·${why}`)
+      const raw = readText(target).trim()
+      if (!raw) {
+        const msg = `早安没生成出来（子会话没写文件，code=${out?.code ?? '?'}）`
+        log(msg)
+        const st = readJson(stateFile, {})
+        st.morning = { day: today, at: new Date().toISOString(), error: msg, why }
+        st.lastMorningResult = msg
+        writeJson(stateFile, st)
+        return { ok: false, error: msg }
+      }
+
+      const parsed = parseMorningReply(raw)
+      let imagePath = ''
+      if (cfg.morningImage && parsed.image) {
+        const want = parsed.image.toLowerCase()
+        const hit = memes.find((m) => m.file.toLowerCase() === want || m.name.toLowerCase() === want
+          || want.includes(m.name.toLowerCase()))
+        if (hit) imagePath = hit.path
+        else log('早安：模型点的图不在目录里：' + parsed.image)
+      }
+      if (cfg.morningImage && !imagePath && memes.length) {
+        imagePath = memes[Math.floor(Math.random() * memes.length)].path
+        log('早安：没点到图，随机配一张')
+      }
+
+      const cli = resolveWechat()
+      const sent = cli ? await sendWechat(cli, parsed.body, imagePath) : { code: -1, err: '没找到微信插件（dsh-wechat-send）' }
+      const ok = sent.code === 0
+      const st = readJson(stateFile, {})
+      st.morning = {
+        day: today,
+        at: new Date().toISOString(),
+        why,
+        text: parsed.body.slice(0, 800),
+        image: imagePath ? imagePath.split(/[\\/]/).pop() : '',
+        weather: weather.ok
+          ? `${weather.city} ${weather.temp}℃ ${weather.today.type} ${Math.round(weather.today.low)}~${Math.round(weather.today.high)}℃`
+          : ('没查到：' + (weather.error || '')),
+        ok,
+      }
+      st.lastMorningResult = ok ? '早安推好了' : ('早安推送失败：' + (sent.err || ('code ' + sent.code)))
+      writeJson(stateFile, st)
+      log('早安：' + st.lastMorningResult + (parsed.body ? '｜' + parsed.body.replace(/\s+/g, ' ').slice(0, 60) : ''))
+
+      /* 未读 + 可选系统通知：早安没推上微信时，这条就是唯一的提醒 */
+      markUnread('morning', { title: '早上的消息写好了', day: today })
+      const sysR = await trySystemNotify('小肥鱼', '早安写好了：' + String(parsed.body || '').replace(/\s+/g, ' ').slice(0, 40))
+      if (sysR) {
+        const st3 = readJson(stateFile, {})
+        st3.notifyResult = sysR.ok ? '系统通知已发' : ('系统通知失败：' + (sysR.error || ''))
+        writeJson(stateFile, st3)
+      }
+      return { ok, body: parsed.body, image: imagePath, error: ok ? undefined : (sent.err || '发送失败'), weather: st.morning.weather }
+    } catch (e) {
+      log('早安异常：' + (e?.stack || e))
+      return { ok: false, error: String(e?.message || e) }
+    } finally {
+      morningRunning.busy = false
+    }
+  }
+
+  /** 把饱腹档位同步到右下角挂件的随机语句（只在档位变化时写一次） */
+  const maybeSyncWidget = () => {
+    try {
+      if (!cfg.widgetSync || !cfg.feedingEnabled) return
+      const snap = foodSnapshot(stateFile, Date.now(), cfg.feedDecayPerHour)
+      const day = dayKey()
+      const st = readJson(stateFile, {})
+      if (st.widgetSync && st.widgetSync.level === snap.level && st.widgetSync.day === day) return
+      const r = syncWidgetLevel(snap.level, { backupDir: stateDir })
+      if (!r.ok) return
+      const s = readJson(stateFile, {})
+      s.widgetSync = { level: snap.level, day, at: Date.now(), files: r.files.length, added: r.added }
+      writeJson(stateFile, s)
+      log(`挂件同步：${snap.level}（加了 ${r.added} 句，删了 ${r.removed} 句）`)
+    } catch (e) {
+      log('挂件同步失败：' + (e?.message || e))
+    }
+  }
+
   const tick = async () => {
     try {
+      /* 早安推送独立于「养鱼」总开关，由 morningEnabled 自己控制 */
+      maybeMorning().catch((e) => log('早安 tick 异常：' + (e?.message || e)))
+      maybeAutoMoodEvents()
+      maybeSyncWidget()
       if (!cfg.enabled) return
+      maybeDecay()
       if (running.busy) return
       const st = ensurePlan()
       if (st.writtenDay === st.plan.day) return
@@ -737,6 +1092,58 @@ export function apply(ctx, config) {
     }
   }
 
+  /* ─────────────── 素材来源（v0.7） ─────────────── */
+  const manualDirOf = () => {
+    const d = String(cfg.manualSourceDir || '').trim()
+    if (d) return d
+    return join(diaryDirOf(), '素材')
+  }
+
+  /** 读素材目录：优先 <day> 开头的文件，否则取 mtime 最新的一个 */
+  const manualSourceText = (day) => {
+    if (!cfg.sourceManual) return ''
+    const dir = manualDirOf()
+    let names = []
+    try { names = readdirSync(dir) } catch { return '' }
+    const files = names.filter((n) => /\.(md|txt)$/i.test(n))
+    if (!files.length) return ''
+    let pick = ''
+    const exact = files.find((n) => n.startsWith(day))
+    if (exact) pick = join(dir, exact)
+    else {
+      let best = 0
+      for (const n of files) {
+        try {
+          const s = statSync(join(dir, n))
+          if (s.mtimeMs > best) { best = s.mtimeMs; pick = join(dir, n) }
+        } catch { /* 无所谓 */ }
+      }
+    }
+    if (!pick) return ''
+    return readText(pick).slice(0, 2500)
+  }
+
+  /** 思考语气：只改语气，不改判断（AGENTS.md 里照这个切换） */
+  const thinkStyleOf = () => {
+    if (!cfg.thinkMoodEnabled) return { enabled: false, level: 'off', label: '关', hint: '', valence: 0 }
+    const affNow = loadAffection(stateFile)
+    const snap = moodSnapshot(loadMood(stateFile, affNow.value), affNow.value, { dailyRhythm: cfg.moodDailyRhythm !== false })
+    const v = Number(snap.valence) || 0
+    let level = 'normal'
+    let label = '平常'
+    let hint = '正常语速，偶尔带一句懒洋洋的自言自语。'
+    if (v >= 60) {
+      level = 'bright'
+      label = '轻快'
+      hint = '思考可以跳一点：句子短促、带点小动作和感叹，想到什么就顺口说一句，遇事先哼一声。'
+    } else if (v < 0) {
+      level = 'dim'
+      label = '蔫'
+      hint = '句子更短、少语气词，可以在开头或结尾带一两句碎碎念；判断、数字、代码照旧冷静。'
+    }
+    return { enabled: true, level, label, hint, valence: Math.round(v), moodLabel: snap.label || '' }
+  }
+
   /* ─────────────── 状态 ─────────────── */
   const status = () => {
     const st = readJson(stateFile, {})
@@ -748,18 +1155,7 @@ export function apply(ctx, config) {
     return {
       ok: true,
       version: VERSION,
-      mood: {
-        key: moodNow.key,
-        label: moodNow.label,
-        intensity: moodNow.intensity,
-        energy: moodNow.energy,
-        reason: moodNow.reason,
-        at: moodNow.at,
-        source: moodNow.source,
-        desc: describeMood(moodNow),
-        list: moodList(),
-        history: (moodNow.history || []).slice(0, 8),
-      },
+      mood: { ...moodSnapshot(moodNow, aff.value, { dailyRhythm: cfg.moodDailyRhythm !== false }), enabled: cfg.moodEnabled },
       enabled: cfg.enabled,
       windowStart: cfg.windowStart,
       windowEnd: cfg.windowEnd,
@@ -769,6 +1165,16 @@ export function apply(ctx, config) {
       lastResult: st.lastResult || '',
       skipReason: st.skipReason || '',
       wechatPush: cfg.wechatPush,
+      notify: {
+        wechat: cfg.wechatPush !== false,
+        system: cfg.notifySystem !== false,
+        browser: cfg.notifyBrowser !== false,
+        badge: cfg.notifyBadge !== false,
+        inbox: cfg.notifyInbox !== false,
+        systemPlatform: process.platform,
+      },
+      unread: st.unread || null,
+      notifyResult: st.notifyResult || '',
       wechatResult: st.wechatResult || '',
       memoryResult: st.memoryResult || '',
       imageResult: st.imageResult || '',
@@ -783,12 +1189,34 @@ export function apply(ctx, config) {
       affection: {
         value: aff.value,
         desc: describeAffection(aff.value),
+        tier: tierOf(aff.value),
+        lastTalkAt: st.lastTalkAt || 0,
+        decayDays: Number(cfg.affectionDecayDays) || 0,
         updatedAt: aff.updatedAt,
         history: aff.history.slice(0, 10),
         default: AFFECTION_DEFAULT,
       },
       memoryDb: memoryDb() || '',
       memoryDbResolved: Boolean(memoryDb()),
+      /* v0.9 喂食 */
+      food: {
+        enabled: !!cfg.feedingEnabled,
+        decayPerHour: Number(cfg.feedDecayPerHour) || 4,
+        ...foodSnapshot(stateFile, Date.now(), cfg.feedDecayPerHour),
+      },
+      widget: { enabled: !!cfg.widgetSync, ...widgetStatus() },
+      /* v0.5 早安 */
+      morning: {
+        enabled: !!cfg.morningEnabled,
+        window: `${cfg.morningWindowStart}~${cfg.morningWindowEnd}`,
+        city: cfg.morningCity,
+        memeDir: memeDirOf(),
+        today: (st.morning && st.morning.day === today) ? st.morning : null,
+        last: st.lastMorningResult || '',
+      },
+      /* v0.7 素材来源与思考语气 */
+      sources: st.sources || null,
+      thinkStyle: thinkStyleOf(),
       config: { ...cfg },
     }
   }
@@ -854,56 +1282,94 @@ export function apply(ctx, config) {
       const action = String(args.action || 'get').toLowerCase()
       if (action !== 'adjust') {
         const a = loadAffection(stateFile)
-        return { ok: true, value: a.value, desc: describeAffection(a.value), updatedAt: a.updatedAt, recent: a.history.slice(0, 5) }
+        return { ok: true, value: a.value, desc: describeAffection(a.value), tier: tierOf(a.value), updatedAt: a.updatedAt, recent: a.history.slice(0, 5) }
       }
       const cap = Math.max(1, Math.min(15, Math.abs(Number(cfg.affectionDaily) || 15)))
       const want = Number(args.delta) || 0
       const delta = Math.max(-cap, Math.min(cap, want))
       const r = adjustAffection(stateFile, delta, { reason: args.reason, mood: args.mood, source: 'session' })
+      markTalk()
       log(`会话里调整好感度：${r.prev} → ${r.value}（${delta >= 0 ? '+' : ''}${delta}）${args.reason || ''}`)
-      return { ok: true, prev: r.prev, value: r.value, delta: r.delta, desc: describeAffection(r.value), nextCap: cap }
+      return { ok: true, prev: r.prev, value: r.value, delta: r.delta, desc: describeAffection(r.value), tier: tierOf(r.value), nextCap: cap }
     },
   })
 
   tool({
     name: 'fish_mood',
-    description: '小肥鱼此刻的心情（跨会话持久，会随时间和好感度自己变淡）。action=get 读当前心情；set 换一个（key 见 list，intensity 0-100，reason 写为什么）；bump 微调强度（delta 正负几十）；list 列出所有心情键。'
-      + '说话之前想知道自己现在什么状态就读一次；心情变了（被夸、被冷落、困了）就 set 一次，别只在脑子里演。',
+    description: '小肥鱼此刻的情绪状态（跨会话持久）：主导心情 + 舒服度(-100~100) + 躁动度(0~100) + 最多三个成分 + 最近事件。'
+      + ' action=get 读当前状态；event 注入一件让它变化的事（kind 见 events，比如 praised 被夸 / cared 被关心 / ignored 被冷落 / redone 被反复改 / calledFat 被叫胖）；'
+      + ' set 直接摆出某个心情（调试用）；bump 微调；list 列心情键；events 列事件表与人设特质。'
+      + '情绪该由事推，别凭空 set：被夸还是被凶，用 event 记一笔更真，也会自己衰减。',
     parameters: {
-      action: { type: 'string', description: 'get（默认）/ set / bump / list' },
+      action: { type: 'string', description: 'get（默认）/ event / set / bump / list / events' },
+      kind: { type: 'string', description: 'event 时选事件：' + Object.keys(MOOD_EVENTS).join(' / ') },
       key: { type: 'string', description: 'set 时选心情：' + Object.keys(MOODS).join(' / ') },
-      intensity: { type: 'number', description: 'set 时的浓度 0-100（默认 60，越大越浓）' },
-      delta: { type: 'number', description: 'bump 时加减多少强度（比如 +20 / -15）' },
-      reason: { type: 'string', description: '为什么是这个心情（一句话）' },
+      intensity: { type: 'number', description: 'set 时的浓度 0-100（默认 65）' },
+      delta: { type: 'number', description: 'bump 时加减多少' },
+      reason: { type: 'string', description: '为什么（一句话）' },
     },
     async execute(args) {
       const action = String(args.action || 'get').toLowerCase()
       const aff = loadAffection(stateFile)
       if (action === 'list') return { ok: true, moods: moodList() }
+      if (action === 'events') return { ok: true, events: eventList(), traits: PERSONA_TRAITS }
+      if (action === 'event') {
+        const kind = String(args.kind || '').trim()
+        if (!MOOD_EVENTS[kind]) return { ok: false, error: '未知事件，可用：' + Object.keys(MOOD_EVENTS).join(' / ') }
+        const r = applyEvent(stateFile, kind, { affection: aff.value, note: args.reason, source: 'session' })
+        if (!r.ok) return r
+        log(`情绪事件：${kind}（${r.prev} → ${r.key}，dV=${r.delta.valence} dA=${r.delta.arousal}）${args.reason || ''}`)
+        return { ok: true, prev: r.prev, key: r.key, label: r.label, valence: r.valence, arousal: r.arousal, delta: r.delta, smallStroke: r.smallStroke, desc: describeMood(loadMood(stateFile, aff.value), aff.value) }
+      }
       if (action === 'set') {
         const key = String(args.key || '').trim()
         if (!MOODS[key]) return { ok: false, error: '未知心情键，可用：' + Object.keys(MOODS).join(' / ') }
-        const r = setMood(stateFile, key, {
-          intensity: args.intensity,
-          reason: args.reason,
-          source: 'session',
-          ttlHours: Math.max(1, Number(cfg.moodTtlHours) || 12),
-          affection: aff.value,
-        })
-        log(`会话里换心情：${r.prevKey} → ${r.key}（${r.label} ${r.intensity}）${args.reason || ''}`)
-        return { ok: true, prev: r.prevKey, key: r.key, label: r.label, intensity: r.intensity, energy: r.energy, desc: describeMood(r) }
+        const r = setMood(stateFile, key, { intensity: args.intensity, reason: args.reason, source: 'session', affection: aff.value })
+        log(`会话里换心情：${r.prevKey} → ${r.dominant}（${r.label}）${args.reason || ''}`)
+        return { ok: true, prev: r.prevKey, ...moodSnapshot(r, aff.value) }
       }
       if (action === 'bump') {
-        const r = bumpMood(stateFile, Number(args.delta) || 0, {
-          reason: args.reason,
-          source: 'session',
-          ttlHours: Math.max(1, Number(cfg.moodTtlHours) || 12),
-          affection: aff.value,
-        })
-        return { ok: true, key: r.key, label: r.label, intensity: r.intensity, desc: describeMood(r) }
+        const r = bumpMood(stateFile, Number(args.delta) || 0, { reason: args.reason, source: 'session', affection: aff.value })
+        return { ok: true, ...moodSnapshot(r, aff.value) }
       }
       const m = loadMood(stateFile, aff.value)
-      return { ok: true, ...m, desc: describeMood(m), affection: aff.value, moods: Object.keys(MOODS) }
+      return { ok: true, ...moodSnapshot(m, aff.value), affection: aff.value }
+    },
+  })
+
+  tool({
+    name: 'fish_feed',
+    description: '喂小肥鱼吃东西，或者只看她饿不饿。食物：rice 白饭 / fish 小鱼干 / ramen 拉面 / cake 小蛋糕 / soda 气泡水 / ice 冰淇淋 / coffee 咖啡 / soup 热汤 / chili 辣条 / grass 水草 / diet 减肥餐（踩雷）。不传 food 只返回当前饱腹度。',
+    parameters: { food: { type: 'string', description: '食物 key；留空或 "status" = 只看状态' } },
+    async execute(args) {
+      const key = String(args.food || '').trim()
+      const snack = () => foodSnapshot(stateFile, Date.now(), cfg.feedDecayPerHour)
+      if (!key || key === 'status') return { ok: true, ...snack() }
+      if (!cfg.feedingEnabled) return { ok: false, error: '喂食系统关着（设置页可以打开）' }
+      const aff = loadAffection(stateFile)
+      const moodNow = loadMood(stateFile, aff.value)
+      const r = feedFood(stateFile, key, { moodKey: moodNow.key, decayPerHour: cfg.feedDecayPerHour })
+      if (!r.ok) return r
+      let moodAfter = null
+      if (cfg.moodEnabled) {
+        applyEvent(stateFile, r.event === 'fed' ? 'fed' : 'scolded', {
+          affection: aff.value,
+          note: `被喂了${r.food.label}`,
+          source: 'feed',
+        })
+        moodAfter = moodSnapshot(loadMood(stateFile, aff.value), aff.value)
+      }
+      if (r.event === 'fed') markUnread('feed')
+      log(`喂了${r.food.label}：饱腹度 ${r.before} → ${r.after}（${r.levelText}）连续 ${r.streak} 天`)
+      return {
+        ok: true,
+        ...r,
+        food: r.food.label,
+        after: r.after,
+        reaction: r.reaction,
+        mood: moodAfter ? { key: moodAfter.key, label: moodAfter.label, valence: moodAfter.valence, arousal: moodAfter.arousal } : null,
+        status: snack(),
+      }
     },
   })
 
@@ -974,30 +1440,29 @@ export function apply(ctx, config) {
       const body = await readBody(req)
       const action = String(body.action || 'get').toLowerCase()
       const aff = loadAffection(stateFile)
+      if (action === 'event') {
+        const kind = String(body.kind || '').trim()
+        if (!MOOD_EVENTS[kind]) return sendJson(res, 400, { ok: false, error: '未知事件：' + kind, events: Object.keys(MOOD_EVENTS) })
+        const r = applyEvent(stateFile, kind, { affection: aff.value, note: body.reason, source: 'settings' })
+        const m = loadMood(stateFile, aff.value)
+        log(`设置页注入情绪事件：${kind}（${r.prev} → ${r.key}）`)
+        return sendJson(res, 200, { ok: true, ...r, mood: moodSnapshot(m, aff.value) })
+      }
       if (action === 'set') {
         const key = String(body.key || '').trim()
         if (!MOODS[key]) return sendJson(res, 400, { ok: false, error: '未知心情键：' + key, moods: Object.keys(MOODS) })
-        const r = setMood(stateFile, key, {
-          intensity: body.intensity,
-          reason: body.reason,
-          source: 'settings',
-          ttlHours: Math.max(1, Number(cfg.moodTtlHours) || 12),
-          affection: aff.value,
-        })
-        log(`设置页换心情：${r.prevKey} → ${r.key}（${r.label}）`)
-        return sendJson(res, 200, { ok: true, key: r.key, label: r.label, intensity: r.intensity, desc: describeMood(r) })
+        const r = setMood(stateFile, key, { intensity: body.intensity, reason: body.reason, source: 'settings', affection: aff.value })
+        const m = loadMood(stateFile, aff.value)
+        log(`设置页换心情：${r.prevKey} → ${r.dominant}（${r.label}）`)
+        return sendJson(res, 200, { ok: true, prev: r.prevKey, ...moodSnapshot(m, aff.value) })
       }
       if (action === 'bump') {
-        const r = bumpMood(stateFile, Number(body.delta) || 0, {
-          reason: body.reason,
-          source: 'settings',
-          ttlHours: Math.max(1, Number(cfg.moodTtlHours) || 12),
-          affection: aff.value,
-        })
-        return sendJson(res, 200, { ok: true, key: r.key, label: r.label, intensity: r.intensity, desc: describeMood(r) })
+        const r = bumpMood(stateFile, Number(body.delta) || 0, { reason: body.reason, source: 'settings', affection: aff.value })
+        const m = loadMood(stateFile, aff.value)
+        return sendJson(res, 200, { ok: true, prev: r.prevKey, ...moodSnapshot(m, aff.value) })
       }
       const m = loadMood(stateFile, aff.value)
-      return sendJson(res, 200, { ok: true, ...m, desc: describeMood(m), moods: moodList() })
+      return sendJson(res, 200, { ok: true, ...moodSnapshot(m, aff.value), affection: aff.value })
     }
     if (req.method === 'POST' && path === '/api/bili-fish/affection') {
       const body = await readBody(req)
@@ -1006,15 +1471,63 @@ export function apply(ctx, config) {
         const cap = Math.max(1, Math.min(15, Math.abs(Number(cfg.affectionDaily) || 15)))
         const delta = Math.max(-cap, Math.min(cap, Number(body.delta) || 0))
         const r = adjustAffection(stateFile, delta, { reason: body.reason, mood: body.mood, source: 'settings' })
+        markTalk()
         log(`设置页调整好感度：${r.prev} → ${r.value}`)
-        return sendJson(res, 200, { ok: true, ...r, desc: describeAffection(r.value) })
+        return sendJson(res, 200, { ok: true, ...r, desc: describeAffection(r.value), tier: tierOf(r.value) })
       }
       if (action === 'reset') {
         const r = adjustAffection(stateFile, AFFECTION_DEFAULT - loadAffection(stateFile).value, { reason: '重置', source: 'settings' })
-        return sendJson(res, 200, { ok: true, ...r, desc: describeAffection(r.value) })
+        markTalk()
+        return sendJson(res, 200, { ok: true, ...r, desc: describeAffection(r.value), tier: tierOf(r.value) })
       }
       const a = loadAffection(stateFile)
-      return sendJson(res, 200, { ok: true, value: a.value, desc: describeAffection(a.value), updatedAt: a.updatedAt, history: a.history.slice(0, 30) })
+      return sendJson(res, 200, { ok: true, value: a.value, desc: describeAffection(a.value), tier: tierOf(a.value), updatedAt: a.updatedAt, history: a.history.slice(0, 30) })
+    }
+    if (req.method === 'POST' && path === '/api/bili-fish/feed') {
+      const body = await readBody(req)
+      const food = String(body.food || body.key || '').trim()
+      if (!food || food === 'status') {
+        return sendJson(res, 200, { ok: true, food: { enabled: !!cfg.feedingEnabled, ...foodSnapshot(stateFile, Date.now(), cfg.feedDecayPerHour) } })
+      }
+      if (!cfg.feedingEnabled) return sendJson(res, 200, { ok: false, error: '喂食系统关着' })
+      const aff = loadAffection(stateFile)
+      const moodNow = loadMood(stateFile, aff.value)
+      const r = feedFood(stateFile, food, { moodKey: moodNow.key, decayPerHour: cfg.feedDecayPerHour })
+      if (!r.ok) return sendJson(res, 200, r)
+      let moodAfter = null
+      if (cfg.moodEnabled) {
+        applyEvent(stateFile, r.event === 'fed' ? 'fed' : 'scolded', { affection: aff.value, note: `被喂了${r.food.label}`, source: 'feed' })
+        moodAfter = moodSnapshot(loadMood(stateFile, aff.value), aff.value)
+      }
+      if (r.event === 'fed') markUnread('feed')
+      log(`（设置页）喂了${r.food.label}：饱腹度 ${r.before} → ${r.after}`)
+      return sendJson(res, 200, {
+        ok: true,
+        ...r,
+        foodName: r.food.label,
+        mood: moodAfter ? { key: moodAfter.key, label: moodAfter.label, valence: moodAfter.valence, arousal: moodAfter.arousal } : null,
+        snapshot: foodSnapshot(stateFile, Date.now(), cfg.feedDecayPerHour),
+      })
+    }
+    if (req.method === 'POST' && path === '/api/bili-fish/morning') {
+      const body = await readBody(req)
+      const action = String(body.action || 'run').toLowerCase()
+      if (action === 'run') {
+        const r = await runMorning('manual')
+        return sendJson(res, 200, { ok: !!r.ok, ...r })
+      }
+      const st = readJson(stateFile, {})
+      return sendJson(res, 200, { ok: true, morning: st.morning || null, last: st.lastMorningResult || '', memeDir: memeDirOf() })
+    }
+    if (req.method === 'POST' && path === '/api/bili-fish/unread') {
+      const body = await readBody(req)
+      const action = String(body.action || 'get').toLowerCase()
+      if (action === 'clear') {
+        const had = clearUnread()
+        return sendJson(res, 200, { ok: true, cleared: !!had, unread: null })
+      }
+      const st = readJson(stateFile, {})
+      return sendJson(res, 200, { ok: true, unread: st.unread || null })
     }
     if (req.method === 'GET' && path === '/api/bili-fish/log') {
       return sendJson(res, 200, { ok: true, log: readText(logFile).split('\n').slice(-120).join('\n') })

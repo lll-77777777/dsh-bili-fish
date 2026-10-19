@@ -1,7 +1,7 @@
 {
   "name": "dsh-bili-fish",
-  "version": "0.3.0",
-  "description": "DSH 插件：养鱼 —— 每天随机醒一次，写两篇日记（给主人的信 / 自己的日记），带持久化好感度、记忆库衔接、日记配图、周回顾与随机小事件",
+  "version": "0.11.1",
+  "description": "DSH 插件：养鱼 —— 每天随机醒一次，写两篇日记（给主人的信 / 自己的日记），带持久化好感度、事件驱动的心情、记忆库衔接、日记配图、周回顾、随机小事件、早安推送、可切换的素材来源、喂食",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -23,7 +23,9 @@
     "client.js",
     "cordis.patch.yml",
     "lib",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "engines": {
     "dsh": ">=0.1.7-rc.1",
