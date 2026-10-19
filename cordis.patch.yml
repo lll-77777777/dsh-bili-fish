@@ -1,0 +1,7 @@
+# dsh-bili-fish —— 养鱼
+#
+# 由 dsh 的 bundle 机制加载：`dsh.bundle.patch` 指向本文件，
+# profile 里插一条 id 为 dsh-bili-fish 的条目即可（插件自己会注册设置页与路由）。
+- insert:
+    - id: dsh-bili-fish
+      name: dsh-bili-fish
