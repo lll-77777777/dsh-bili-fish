@@ -1,7 +1,7 @@
 {
   "name": "dsh-bili-fish",
-  "version": "0.1.0",
-  "description": "DSH 插件：养鱼 —— 每天随机醒一次，写两篇日记（给主人的信 / 自己的日记）",
+  "version": "0.3.0",
+  "description": "DSH 插件：养鱼 —— 每天随机醒一次，写两篇日记（给主人的信 / 自己的日记），带持久化好感度、记忆库衔接、日记配图、周回顾与随机小事件",
   "keywords": [
     "dsh",
     "dsh-plugin",
