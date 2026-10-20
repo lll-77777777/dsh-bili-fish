@@ -112,10 +112,14 @@ DeepSeek\ Harness.exe resources/app.asar/dsh/node_modules/@deepseek-ai/dsh/lib/b
 
 ## 可选依赖
 
+> **推荐配合 [meow-memory](https://github.com/Phant0Meow/dsh-meow-memory) 使用。**
+> 装上它，养鱼才有长期记忆，记得你是谁、记得你上次说过什么。
+> 不装也能跑，但每次写日记，它都像第一次见你。
+
 | 依赖 | 用来做什么 | 没有会怎样 |
 | --- | --- | --- |
 | [dsh-bili-scroll](https://github.com/lll-77777777/dsh-bili-scroll) | 每轮把 B 站报告写到 `~/.dsh/bili-duty/out/<日期>.md` | 素材少一块，写「空白日」 |
-| meow-memory | 记忆库 | 不读也不写记忆 |
+| [meow-memory](https://github.com/Phant0Meow/dsh-meow-memory) | 记忆库 | 不读也不写记忆 |
 | dsh-agnes-image | 日记配图 | 不配图 |
 | dsh-wechat-plugin | 把日记推到微信 | 只落盘 |
 | dsh-whale-widget | 右下角小鲸鱼：饿了会嘟囔 | 挂件不同步 |
